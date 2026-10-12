@@ -25,6 +25,7 @@ elif "copy" in args:
     dest = Path(args[args.index("copy") + 2])
     if os.environ.get("FAKE_RCLONE_FAIL"):
         print(json.dumps({"level": "error", "msg": "trust token abgelaufen"}))
+        print(json.dumps({"level": "error", "object": "Pages/Brief.pages", "msg": "corrupted on transfer"}))
         sys.exit(7)
     (dest / "datei.txt").write_text("x")
     print(json.dumps({"level": "notice", "msg": "Transferred", "stats": {"bytes": 1, "totalBytes": 1, "transfers": 1, "totalTransfers": 1, "errors": 0}}))

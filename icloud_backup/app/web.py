@@ -30,7 +30,9 @@ WARN_DAYS = 5
 APP_CSS = (APP_ROOT / "app.css").read_text(encoding="utf-8")
 
 JOBS = {
-    "drive": {"label": "iCloud Drive", "folder": "iCloud Drive", "args": []},
+    # iCloud meldet für Paket-Dokumente (Pages, Numbers, Pixelmator …) die entpackte Größe, liefert aber ein
+    # ZIP; ohne --ignore-size endet das als „corrupted on transfer: sizes differ“.
+    "drive": {"label": "iCloud Drive", "folder": "iCloud Drive", "args": ["--ignore-size"]},
     # Nur „All Photos“ jeder Mediathek, sonst landet jedes Foto zusätzlich in jedem Album-Ordner.
     "photos": {"label": "iCloud-Fotos", "folder": "iCloud Fotos",
                "args": ["--iclouddrive-service", "photos", "--include", "/*/All Photos/**"]},
@@ -218,7 +220,11 @@ def parse_log_line(line: str) -> tuple[dict | None, str | None]:
         return None, None
     if not isinstance(entry, dict):
         return None, None
-    error = entry.get("msg", "").strip() if entry.get("level") in ("error", "critical") else None
+    error = None
+    if entry.get("level") in ("error", "critical"):
+        error = entry.get("msg", "").strip()
+        if entry.get("object"):
+            error = f"{entry['object']}: {error}"
     return entry.get("stats"), error
 
 
@@ -559,8 +565,9 @@ def log_page() -> str:
         for line in lines:
             try:
                 entry = json.loads(line)
+                obj = f"{entry['object']}: " if entry.get("object") else ""
                 out.append(f"{entry.get('time', '')[:19].replace('T', ' ')}  {entry.get('level', '').upper():7} "
-                           f"{entry.get('msg', '').strip()}")
+                           f"{obj}{entry.get('msg', '').strip()}")
             except ValueError:
                 out.append(line)
         text = h("\n".join(out)) or "Noch kein Protokoll vorhanden."

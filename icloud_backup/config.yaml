@@ -1,7 +1,7 @@
 name: iCloud Backup
 description: Sichert iCloud Drive und iCloud-Fotos auf eine Netzwerkfreigabe
 url: https://github.com/dhaucke/ha-icloud-backup
-version: "2026.10.2"
+version: "2026.10.3"
 slug: icloud_backup
 init: false
 arch:

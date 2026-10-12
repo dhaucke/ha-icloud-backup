@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026.10.3
+
+- iCloud Drive: Paket-Dokumente (Pages, Numbers, Keynote, Pixelmator …) brechen nicht mehr mit „corrupted on transfer: sizes differ“ ab. iCloud meldet für sie die entpackte Größe, liefert aber ein ZIP.
+- Fehlermeldungen in Übersicht und Protokoll nennen jetzt die betroffene Datei.
+
 ## 2026.10.2
 
 - Eigenes Icon und Banner im Add-on-Store.

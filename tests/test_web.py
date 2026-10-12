@@ -131,6 +131,8 @@ class BackupTests(Base):
         self.assertTrue((self.root / "nas" / "iCloud Fotos" / "datei.txt").exists())
         photos = [c for c in calls() if "copy" in c][1]
         self.assertIn("/*/All Photos/**", photos)
+        self.assertNotIn("--ignore-size", photos)
+        self.assertIn("--ignore-size", [c for c in calls() if "copy" in c][0])
         self.assertIn("photos", photos)
         self.assertEqual(web.next_run(), datetime.fromisoformat(web.STATE["last_start"]) + timedelta(hours=24))
 
@@ -140,9 +142,10 @@ class BackupTests(Base):
         os.environ["FAKE_RCLONE_FAIL"] = "1"
         with mock.patch.object(web, "on_mount", return_value=True):
             web.run_backup()
-        self.assertEqual(web.STATE["jobs"]["drive"]["error"], "trust token abgelaufen")
+        self.assertEqual(web.STATE["jobs"]["drive"]["error"], "Pages/Brief.pages: corrupted on transfer")
         created = [c for c in self.notes.call_args_list if c.args[0] == "create"]
-        self.assertIn("iCloud Drive: trust token abgelaufen", created[-1].args[1]["message"])
+        self.assertIn("iCloud Drive: Pages/Brief.pages: corrupted on transfer", created[-1].args[1]["message"])
+        self.assertIn("Pages/Brief.pages: corrupted on transfer", web.log_page())
 
 
 class HttpTests(Base):
