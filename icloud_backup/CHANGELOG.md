@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026.10.2
+
+- Eigenes Icon und Banner im Add-on-Store.
+
 ## 2026.10.1
 
 - Erste Version: iCloud Drive und iCloud-Fotos per rclone 1.75.2 auf eine Netzwerkfreigabe kopieren.

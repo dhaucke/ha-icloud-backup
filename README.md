@@ -1,3 +1,5 @@
+![iCloud Backup für Home Assistant](https://raw.githubusercontent.com/dhaucke/ha-icloud-backup/main/assets/icloud-backup-banner.png)
+
 # iCloud Backup für Home Assistant
 
 Home-Assistant-Add-on, das **iCloud Drive** und **iCloud-Fotos** regelmäßig auf eine Netzwerkfreigabe kopiert.
