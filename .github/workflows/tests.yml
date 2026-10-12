@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Anwendung testen
+        run: python -m unittest discover -s tests -v
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Add-on-Image bauen
+        run: docker build -t icloud-backup-test ./icloud_backup
+      - name: rclone im Image prüfen
+        run: docker run --rm --entrypoint rclone icloud-backup-test version
