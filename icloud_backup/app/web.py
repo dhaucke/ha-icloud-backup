@@ -1,4 +1,4 @@
-"""iCloud Backup: sichert iCloud Drive und iCloud-Fotos per rclone auf eine Netzwerkfreigabe."""
+"""iCloud Backup: sichert iCloud Drive und iCloud-Fotos mehrerer Apple-IDs per rclone auf Netzwerkfreigaben."""
 from __future__ import annotations
 
 import html
@@ -21,7 +21,7 @@ RCLONE = os.environ.get("ICB_RCLONE", "rclone")
 CONF = DATA_DIR / "rclone.conf"
 STATE_FILE = DATA_DIR / "state.json"
 LOG_DIR = DATA_DIR / "logs"
-REMOTE = "icloud"
+LEGACY_REMOTE = "icloud"  # Remote-Name bis 2026.10.3, bleibt die ID des übernommenen Kontos
 TARGET_ROOTS = (Path("/share"), Path("/media"))
 INGRESS_PROXY = "172.30.32.2"
 ALLOW_ANY_CLIENT = os.environ.get("ICB_ALLOW_ANY_CLIENT") == "1"  # nur für lokale Entwicklung
@@ -37,11 +37,10 @@ JOBS = {
     "photos": {"label": "iCloud-Fotos", "folder": "iCloud Fotos",
                "args": ["--iclouddrive-service", "photos", "--include", "/*/All Photos/**"]},
 }
-DEFAULT_SETTINGS = {"target": "", "drive": True, "photos": True, "interval_hours": 24}
 STATUS_LABELS = {"running": "Läuft", "ok": "Erfolgreich", "error": "Fehler", "cancelled": "Abgebrochen"}
 
 LOCK = threading.RLock()
-AUTH_LOCK = threading.Lock()  # eine Anmeldung zur Zeit, rclone.conf und pending gehören zusammen
+AUTH_LOCK = threading.Lock()  # eine Kontoänderung zur Zeit, rclone.conf und pending gehören zusammen
 RUN = {"active": False, "cancel": False, "proc": None}
 STATE: dict = {}
 
@@ -53,15 +52,33 @@ def load_state() -> dict:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         state = {}
-    state["settings"] = {**DEFAULT_SETTINGS, **state.get("settings", {})}
-    state.setdefault("login", {})
-    state.setdefault("jobs", {})
+    old = state.get("settings", {})
+    state["settings"] = {"interval_hours": old.get("interval_hours", 24)}
+    accounts = state.setdefault("accounts", {})
+    login = state.pop("login", {})
+    if not accounts and (login or old.get("target")):  # bis 2026.10.3: genau ein Konto, Ziel bleibt gleich
+        accounts[LEGACY_REMOTE] = {
+            "name": login.get("apple_id") or "iCloud", "apple_id": login.get("apple_id", ""),
+            "target": old.get("target", ""), "drive": old.get("drive", True), "photos": old.get("photos", True),
+            "jobs": state.get("jobs", {}),
+            **({"login_at": login["login_at"]} if login.get("login_at") else {}),
+        }
+        for key in JOBS:
+            if (LOG_DIR / f"{key}.log").exists():
+                (LOG_DIR / f"{key}.log").replace(log_path(LEGACY_REMOTE, key))
+    for key in ("jobs", "expiry_notified", "run_error"):
+        state.pop(key, None)
+    if "account" not in state.get("pending", {"account": ""}):  # offene Anmeldung aus alter Version
+        state.pop("pending")
     if not CONF.exists():  # rclone.conf ist vom HA-Backup ausgenommen, nach Wiederherstellung neu anmelden
-        state["login"].pop("login_at", None)
         state.pop("pending", None)
-    for job in state["jobs"].values():
-        if job.get("status") == "running":  # Container wurde während einer Sicherung neu gestartet
-            job["status"] = "cancelled"
+    for acc in accounts.values():
+        acc.setdefault("jobs", {})
+        if not CONF.exists():
+            acc.pop("login_at", None)
+        for job in acc["jobs"].values():
+            if job.get("status") == "running":  # Container wurde während einer Sicherung neu gestartet
+                job["status"] = "cancelled"
     return state
 
 
@@ -76,15 +93,51 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def account_items() -> list[tuple[str, dict]]:
+    """Schnappschuss der Konten, damit Anlegen/Löschen keine laufende Schleife sprengt."""
+    with LOCK:
+        return list(STATE["accounts"].items())
+
+
+def get_account(acc_id: str) -> dict:
+    acc = STATE["accounts"].get(acc_id)
+    if acc is None:
+        raise ValueError("Dieses Konto gibt es nicht mehr.")
+    return acc
+
+
+def new_account_id() -> str:
+    n = 1
+    while f"icloud{n}" in STATE["accounts"]:
+        n += 1
+    return f"icloud{n}"  # zugleich Name des rclone-Remotes
+
+
 # ---------------------------------------------------------------- Ziel
 
-def validate_target(raw: str) -> Path:
+def validate_target(raw: str, create: bool = False) -> Path:
     path = Path(os.path.realpath(raw.strip() or "/"))
     if not any(path.is_relative_to(root) and path != root for root in TARGET_ROOTS):
         raise ValueError("Das Ziel muss ein Ordner unterhalb von /share oder /media sein.")
+    if create and not path.exists() and path.parent.is_dir() and on_mount(path.parent):
+        path.mkdir()  # z. B. /share/nas-backup/Anna für ein weiteres Konto, nur auf eingebundener Freigabe
     if not path.is_dir():
         raise ValueError(f"Den Ordner {path} gibt es nicht. Ist die Netzwerkfreigabe in Home Assistant eingebunden?")
     return path
+
+
+def validate_account_target(raw: str, acc_id: str) -> Path:
+    target = validate_target(raw, create=True)
+    for other_id, other in account_items():
+        if other_id == acc_id or not other.get("target"):
+            continue
+        theirs = Path(other["target"])
+        # Daneben oder darunter ist erlaubt, nur nicht im selben Ordner oder in den Sicherungsordnern des anderen
+        if target == theirs or any(a.is_relative_to(b / job["folder"]) for a, b in ((target, theirs), (theirs, target))
+                                   for job in JOBS.values()):
+            raise ValueError(f"{target} überschneidet sich mit dem Ziel von „{other['name']}“ ({theirs}). "
+                             "Bitte je Konto einen eigenen Ordner wählen.")
+    return target
 
 
 def on_mount(path: Path) -> bool:
@@ -127,17 +180,28 @@ def rclone_config(*args: str) -> dict:
     return json.loads(out) if out.startswith("{") else {"State": ""}
 
 
-def login_start(apple_id: str, password: str) -> bool:
+def rclone_delete(remote: str) -> None:
+    """Entfernt ein Remote samt Token; „config create“ würde alte Schlüssel sonst übernehmen."""
+    if not CONF.exists():
+        return
+    proc = subprocess.run([RCLONE, "--config", str(CONF), "config", "delete", remote],
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise ValueError(f"Zugangsdaten konnten nicht entfernt werden: {clean_error(proc.stderr)}")
+
+
+def login_start(acc_id: str, apple_id: str, password: str) -> bool:
     if not apple_id or not password:
         raise ValueError("Apple-ID und Passwort sind Pflicht.")
     with LOCK:  # gleiche Sperre wie die Zulassung in run_backup
         if RUN["active"]:
             raise ValueError("Während einer Sicherung ist keine Neuanmeldung möglich.")
-        STATE["login"].pop("login_at", None)  # bis zur neuen 2FA keine Sicherungen mit halber Konfiguration
+        get_account(acc_id).pop("login_at", None)  # bis zur neuen 2FA keine Sicherungen mit halber Konfiguration
+        STATE.pop("pending", None)
         save_state()
-    CONF.unlink(missing_ok=True)
-    out = rclone_config("create", REMOTE, "iclouddrive", f"apple_id={apple_id}", f"password={password}", "--obscure")
-    return login_step(out, apple_id)
+    rclone_delete(acc_id)
+    out = rclone_config("create", acc_id, "iclouddrive", f"apple_id={apple_id}", f"password={password}", "--obscure")
+    return login_step(out, acc_id, apple_id)
 
 
 def login_continue(answer: str) -> bool:
@@ -146,33 +210,81 @@ def login_continue(answer: str) -> bool:
         raise ValueError("Keine Anmeldung offen. Bitte neu beginnen.")
     if not answer.strip():
         raise ValueError("Bitte eine Antwort eingeben.")
-    out = rclone_config("update", REMOTE, "--continue", "--state", pending["state"], "--result", answer.strip())
-    return login_step(out, pending["apple_id"])
+    get_account(pending["account"])
+    out = rclone_config("update", pending["account"], "--continue", "--state", pending["state"], "--result", answer.strip())
+    return login_step(out, pending["account"], pending["apple_id"])
 
 
-def login_step(out: dict, apple_id: str) -> bool:
+def login_step(out: dict, acc_id: str, apple_id: str) -> bool:
     """Wertet eine rclone-Antwort aus. True = fertig angemeldet, False = weitere Frage offen."""
     if out.get("Error"):
         raise ValueError(out["Error"])  # offene Frage bleibt bestehen, Eingabe kann wiederholt werden
     with LOCK:
         if out.get("State"):
-            STATE["pending"] = {"state": out["State"], "option": out.get("Option") or {}, "apple_id": apple_id}
+            STATE["pending"] = {"account": acc_id, "state": out["State"], "option": out.get("Option") or {},
+                                "apple_id": apple_id}
             save_state()
             return False
         STATE.pop("pending", None)
-        STATE.pop("expiry_notified", None)
-        STATE["login"] = {"apple_id": apple_id, "login_at": now_iso()}
+        acc = get_account(acc_id)
+        acc.pop("expiry_notified", None)
+        acc.update(apple_id=apple_id, login_at=now_iso())
         save_state()
     CONF.chmod(0o600)
-    ha_notification("dismiss", {"notification_id": "icloud_backup_login"})
+    ha_notification("dismiss", {"notification_id": f"icloud_backup_login_{acc_id}"})
     return True
 
 
-def login_days_left(now: datetime) -> int | None:
-    login_at = STATE["login"].get("login_at")
+def login_days_left(acc: dict, now: datetime) -> int | None:
+    login_at = acc.get("login_at")
     if not login_at:
         return None
     return TOKEN_DAYS - (now - datetime.fromisoformat(login_at)).days
+
+
+# ---------------------------------------------------------------- Konten
+
+def add_account(form: dict) -> str:
+    name = form.get("name", "").strip()
+    if not name:
+        raise ValueError("Bitte einen Namen für das Konto eingeben.")
+    acc_id = new_account_id()
+    target = validate_account_target(form.get("target", ""), acc_id)
+    with LOCK:
+        STATE["accounts"][acc_id] = {"name": name, "apple_id": form.get("apple_id", "").strip(), "target": str(target),
+                                     "drive": "drive" in form, "photos": "photos" in form, "jobs": {}}
+        save_state()
+    return acc_id
+
+
+def update_account(acc_id: str, form: dict) -> Path:
+    acc = get_account(acc_id)
+    name = form.get("name", "").strip()
+    if not name:
+        raise ValueError("Bitte einen Namen für das Konto eingeben.")
+    target = validate_account_target(form.get("target", ""), acc_id)
+    with LOCK:
+        if RUN["active"]:  # sonst könnte ein anderes Konto das noch beschriebene Ziel übernehmen
+            raise ValueError("Während einer Sicherung können Konten nicht geändert werden.")
+        acc.update(name=name, target=str(target), drive="drive" in form, photos="photos" in form)
+        save_state()
+    return target
+
+
+def delete_account(acc_id: str) -> str:
+    with LOCK:  # durchgehend, damit run_backup das Konto nicht mitten im Löschen zulässt
+        if RUN["active"]:
+            raise ValueError("Während einer Sicherung kann kein Konto entfernt werden.")
+        get_account(acc_id)
+        rclone_delete(acc_id)  # zuerst, damit bei einem Fehler das Konto sichtbar bleibt
+        acc = STATE["accounts"].pop(acc_id)
+        if STATE.get("pending", {}).get("account") == acc_id:
+            STATE.pop("pending")
+        save_state()
+        for key in JOBS:  # die ID wird wiederverwendet, sonst erbt das nächste Konto diese Protokolle
+            log_path(acc_id, key).unlink(missing_ok=True)
+    ha_notification("dismiss", {"notification_id": f"icloud_backup_login_{acc_id}"})
+    return acc["name"]
 
 
 # ---------------------------------------------------------------- Benachrichtigungen
@@ -198,16 +310,17 @@ def notify(notification_id: str, title: str, message: str) -> None:
 
 
 def check_expiry(now: datetime) -> None:
-    left = login_days_left(now)
-    if left is None or left > WARN_DAYS or STATE.get("expiry_notified") == date.today().isoformat():
-        return
-    with LOCK:
-        STATE["expiry_notified"] = date.today().isoformat()
-        save_state()
-    text = (f"Die iCloud-Anmeldung läuft in {left} Tagen ab." if left > 0
-            else "Die iCloud-Anmeldung ist abgelaufen, Sicherungen schlagen fehl.")
-    notify("icloud_backup_login", "iCloud Backup: neu anmelden",
-           f"{text} Bitte im Add-on unter „Anmeldung“ neu anmelden.")
+    for acc_id, acc in account_items():
+        left = login_days_left(acc, now)
+        if left is None or left > WARN_DAYS or acc.get("expiry_notified") == date.today().isoformat():
+            continue
+        with LOCK:
+            acc["expiry_notified"] = date.today().isoformat()
+            save_state()
+        text = (f"Die iCloud-Anmeldung für „{acc['name']}“ läuft in {left} Tagen ab." if left > 0
+                else f"Die iCloud-Anmeldung für „{acc['name']}“ ist abgelaufen, Sicherungen schlagen fehl.")
+        notify(f"icloud_backup_login_{acc_id}", "iCloud Backup: neu anmelden",
+               f"{text} Bitte im Add-on unter „Konten“ neu anmelden.")
 
 
 # ---------------------------------------------------------------- Sicherung
@@ -228,28 +341,32 @@ def parse_log_line(line: str) -> tuple[dict | None, str | None]:
     return entry.get("stats"), error
 
 
-def set_job(key: str, **values) -> None:
+def set_job(acc: dict, key: str, **values) -> None:
     with LOCK:
-        STATE["jobs"].setdefault(key, {}).update(values)
+        acc["jobs"].setdefault(key, {}).update(values)
         save_state()
 
 
-def run_job(key: str, target: Path) -> dict:
+def log_path(acc_id: str, key: str) -> Path:
+    return LOG_DIR / f"{acc_id}-{key}.log"
+
+
+def run_job(acc_id: str, acc: dict, key: str, target: Path) -> dict:
     job = JOBS[key]
     dest = target / job["folder"]
     dest.mkdir(exist_ok=True)
     if not on_mount(Path(os.path.realpath(dest))):  # z. B. Symlink auf lokale Platte
         raise ValueError(f"{dest} zeigt nicht auf eine eingebundene Freigabe.")
     cmd = [
-        RCLONE, "--config", str(CONF), "copy", f"{REMOTE}:", str(dest), *job["args"],
+        RCLONE, "--config", str(CONF), "copy", f"{acc_id}:", str(dest), *job["args"],
         "--cache-dir", str(DATA_DIR / "cache"), "--use-json-log", "--log-level", "NOTICE",
         "--stats", "15s", "--stats-log-level", "NOTICE",
     ]
     with LOCK:
-        STATE["jobs"][key] = {"status": "running", "started": now_iso(), "finished": "", "stats": {}, "error": ""}
+        acc["jobs"][key] = {"status": "running", "started": now_iso(), "finished": "", "stats": {}, "error": ""}
         save_state()
     last_error = ""
-    with (LOG_DIR / f"{key}.log").open("w", encoding="utf-8") as log, \
+    with log_path(acc_id, key).open("w", encoding="utf-8") as log, \
             subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
         with LOCK:
             RUN["proc"] = proc
@@ -261,7 +378,7 @@ def run_job(key: str, target: Path) -> dict:
             stats, error = parse_log_line(line)
             last_error = error or last_error
             if stats:
-                set_job(key, stats=stats)
+                set_job(acc, key, stats=stats)
     RUN["proc"] = None
     if RUN["cancel"]:
         status, error = "cancelled", ""
@@ -269,8 +386,31 @@ def run_job(key: str, target: Path) -> dict:
         status, error = "ok", ""
     else:
         status, error = "error", last_error or f"rclone wurde mit Code {proc.returncode} beendet."
-    set_job(key, status=status, finished=now_iso(), error=error)
-    return STATE["jobs"][key]
+    set_job(acc, key, status=status, finished=now_iso(), error=error)
+    return acc["jobs"][key]
+
+
+def backup_account(acc_id: str, acc: dict) -> list[str]:
+    """Sichert ein Konto und liefert die Fehlermeldungen für die Benachrichtigung."""
+    failures = []
+    try:
+        target = validate_target(acc["target"])
+        if not on_mount(target):
+            raise ValueError(f"{target} liegt nicht auf einer eingebundenen Freigabe. Sicherung übersprungen, "
+                             "damit die Home-Assistant-Festplatte nicht vollläuft.")
+        for key, job in JOBS.items():
+            if acc[key] and not RUN["cancel"]:
+                result = run_job(acc_id, acc, key, target)
+                if result["status"] == "error":
+                    failures.append(f"{acc['name']} – {job['label']}: {result['error']}")
+        error = ""
+    except (ValueError, OSError) as exc:
+        error = str(exc)
+        failures.append(f"{acc['name']}: {error}")
+    with LOCK:
+        acc["run_error"] = error
+        save_state()
+    return failures
 
 
 def run_backup() -> None:
@@ -279,36 +419,26 @@ def run_backup() -> None:
             return
         RUN.update(active=True, cancel=False)
         STATE["last_start"] = now_iso()
-        STATE["run_error"] = ""
         save_state()
     try:
-        settings = STATE["settings"]
-        target = validate_target(settings["target"])
-        if not on_mount(target):
-            raise ValueError(f"{target} liegt nicht auf einer eingebundenen Freigabe. Sicherung übersprungen, "
-                             "damit die Home-Assistant-Festplatte nicht vollläuft.")
         failures = []
-        for key, job in JOBS.items():
-            if settings[key] and not RUN["cancel"]:
-                result = run_job(key, target)
-                if result["status"] == "error":
-                    failures.append(f"{job['label']}: {result['error']}")
+        for acc_id, acc in account_items():
+            if account_ready(acc) and not RUN["cancel"]:
+                failures += backup_account(acc_id, acc)
         if failures:
             notify("icloud_backup_error", "iCloud Backup fehlgeschlagen", "\n".join(failures))
         elif not RUN["cancel"]:
             ha_notification("dismiss", {"notification_id": "icloud_backup_error"})
-    except (ValueError, OSError) as exc:
-        with LOCK:
-            STATE["run_error"] = str(exc)
-            save_state()
-        notify("icloud_backup_error", "iCloud Backup fehlgeschlagen", str(exc))
     finally:
         RUN["active"] = False
 
 
+def account_ready(acc: dict) -> bool:
+    return bool(acc.get("target") and (acc["drive"] or acc["photos"]) and acc.get("login_at"))
+
+
 def is_ready() -> bool:
-    settings = STATE["settings"]
-    return bool(settings["target"] and (settings["drive"] or settings["photos"]) and STATE["login"].get("login_at"))
+    return any(account_ready(acc) for _, acc in account_items())
 
 
 def next_run() -> datetime | None:
@@ -354,7 +484,7 @@ def fmt_bytes(value) -> str:
 
 
 def layout(base: str, title: str, body: str, active: str, refresh: bool = False) -> str:
-    nav = [("/", "dashboard", "Übersicht"), ("/login", "login", "Anmeldung"),
+    nav = [("/", "dashboard", "Übersicht"), ("/accounts", "accounts", "Konten"),
            ("/settings", "settings", "Einstellungen"), ("/log", "log", "Protokoll")]
     links = "".join(
         f'<a class="{"active" if key == active else ""}" href="{base}{url}">{label}</a>' for url, key, label in nav
@@ -387,8 +517,8 @@ def alert(message: str, level: str = "") -> str:
     return f'<div class="alert {h(level)}">{message}</div>' if message else ""
 
 
-def login_status_text(now: datetime) -> tuple[str, str]:
-    left = login_days_left(now)
+def login_status_text(acc: dict, now: datetime) -> tuple[str, str]:
+    left = login_days_left(acc, now)
     if left is None:
         return "Nicht angemeldet", "error"
     if left <= 0:
@@ -396,14 +526,14 @@ def login_status_text(now: datetime) -> tuple[str, str]:
     return f"Noch {left} Tage gültig", "warn" if left <= WARN_DAYS else "ok"
 
 
-def job_card(key: str) -> str:
-    job = STATE["jobs"].get(key)
+def job_card(acc: dict, key: str) -> str:
+    job = acc["jobs"].get(key)
     label = JOBS[key]["label"]
-    if not STATE["settings"][key]:
+    if not acc[key]:
         return f'<article class="card job"><div class="job-head"><h2>{label}</h2><span class="status">Deaktiviert</span></div></article>'
     if not job:
         return (f'<article class="card job"><div class="job-head"><h2>{label}</h2><span class="status">Noch nie gesichert</span></div>'
-                f'<p class="muted">Ziel: {h(STATE["settings"]["target"] or "–")}/{h(JOBS[key]["folder"])}</p></article>')
+                f'<p class="muted">Ziel: {h(acc["target"] or "–")}/{h(JOBS[key]["folder"])}</p></article>')
     stats = job.get("stats") or {}
     progress = ""
     if job["status"] == "running":
@@ -429,37 +559,46 @@ def job_card(key: str) -> str:
 </article>"""
 
 
+def account_section(base: str, acc: dict, now: datetime) -> str:
+    login_text, login_level = login_status_text(acc, now)
+    notes = alert(h(acc.get("run_error")), "error")
+    if not acc.get("login_at"):
+        notes += alert(f'„{h(acc["name"])}“ ist nicht angemeldet. <a href="{base}/accounts">Jetzt anmelden</a>')
+    return f"""<h2 class="account-title">{h(acc['name'])}</h2>
+{notes}
+<div class="stats">
+  <article><span>Apple-ID</span><strong class="path">{h(acc.get('apple_id') or '–')}</strong></article>
+  <article><span>Anmeldung</span><strong class="{login_level}">{h(login_text)}</strong></article>
+  <article><span>Ziel</span><strong class="path">{h(acc['target'] or '–')}</strong></article>
+</div>
+<div class="jobs">{job_card(acc, 'drive')}{job_card(acc, 'photos')}</div>"""
+
+
 def dashboard(base: str) -> str:
     now = datetime.now()
-    settings = STATE["settings"]
-    notes = ""
-    if not STATE["login"].get("login_at"):
-        notes += alert(f'Noch nicht bei iCloud angemeldet. <a href="{base}/login">Jetzt anmelden</a>')
-    if not settings["target"]:
-        notes += alert(f'Noch kein Sicherungsziel gewählt. <a href="{base}/settings">Ziel festlegen</a>')
-    notes += alert(h(STATE.get("run_error")), "error")
-    login_text, login_level = login_status_text(now)
+    accounts = STATE["accounts"]
+    notes = "" if accounts else alert(f'Noch kein iCloud-Konto eingerichtet. <a href="{base}/accounts">Konto hinzufügen</a>')
     due = next_run()
     next_text = "Läuft gerade" if RUN["active"] else (fmt_time(due.isoformat()) if due else "–")
     if RUN["active"]:
         buttons = f'<form method="post" action="{base}/cancel"><button class="button danger">Sicherung abbrechen</button></form>'
     else:
         disabled = "" if is_ready() else "disabled"
-        buttons = f'<form method="post" action="{base}/run"><button class="button primary" {disabled}>Jetzt sichern</button></form>'
+        buttons = f'<form method="post" action="{base}/run"><button class="button primary" {disabled}>Alle Konten jetzt sichern</button></form>'
+    sections = "".join(account_section(base, acc, now) for _, acc in account_items())
     return f"""{notes}
 <div class="actions">{buttons}</div>
 <div class="stats">
-  <article><span>Anmeldung</span><strong class="{login_level}">{h(login_text)}</strong></article>
+  <article><span>Konten</span><strong>{len(accounts)}</strong></article>
   <article><span>Letzte Sicherung</span><strong>{fmt_time(STATE.get('last_start'))}</strong></article>
   <article><span>Nächste Sicherung</span><strong>{h(next_text)}</strong></article>
-  <article><span>Ziel</span><strong class="path">{h(settings['target'] or '–')}</strong></article>
 </div>
-<div class="jobs">{job_card('drive')}{job_card('photos')}</div>"""
+{sections}"""
 
 
 QUESTION_LABELS = {
     "config_2fa": ("Bestätigungscode",
-                   "Apple hat einen sechsstelligen Code an deine Apple-Geräte geschickt. "
+                   "Apple hat einen sechsstelligen Code an die Apple-Geräte dieser Apple-ID geschickt. "
                    "Kommt keiner an, gib <b>sms</b> ein, dann kommt der Code per SMS."),
     "config_2fa_sms": ("Code aus der SMS", "Gib den Code aus der SMS ein."),
     "config_2fa_phone": ("Telefonnummer", "An welche Nummer soll die SMS gehen?"),
@@ -478,72 +617,103 @@ def question_field(option: dict) -> str:
     return f'<p class="muted">{hint}</p><label class="wide"><span>{label}</span>{field}</label>'
 
 
-def login_page(base: str) -> str:
+def target_datalist() -> str:
+    return '<datalist id="targets">' + "".join(f'<option value="{h(p)}">' for p, _ in target_candidates()) + "</datalist>"
+
+
+def account_fields(acc: dict) -> str:
+    checked = {key: "checked" if acc.get(key, True) else "" for key in JOBS}
+    return f"""<label><span>Name</span><input name="name" required placeholder="Denis" value="{h(acc.get('name'))}"></label>
+      <label><span>Sicherungsziel</span>
+        <input name="target" list="targets" required placeholder="/share/nas-backup/Denis" value="{h(acc.get('target'))}"></label>
+      <label class="check"><input type="checkbox" name="drive" {checked['drive']}><span>iCloud Drive sichern</span></label>
+      <label class="check"><input type="checkbox" name="photos" {checked['photos']}><span>iCloud-Fotos sichern</span></label>"""
+
+
+def account_card(base: str, acc_id: str, acc: dict, now: datetime) -> str:
+    text, level = login_status_text(acc, now)
+    valid = "–"
+    if acc.get("login_at"):
+        valid = fmt_time((datetime.fromisoformat(acc["login_at"]) + timedelta(days=TOKEN_DAYS)).isoformat())
+    hidden = f'<input type="hidden" name="id" value="{h(acc_id)}">'
+    return f"""<article class="card form">
+  <h2>{h(acc['name'])}</h2>
+  <dl class="facts">
+    <div><dt>Apple-ID</dt><dd>{h(acc.get('apple_id') or '–')}</dd></div>
+    <div><dt>Status</dt><dd class="{level}">{h(text)}</dd></div>
+    <div><dt>Angemeldet am</dt><dd>{fmt_time(acc.get('login_at'))}</dd></div>
+    <div><dt>Gültig bis</dt><dd>{valid}</dd></div>
+  </dl>
+  <form method="post" action="{base}/accounts/login">{hidden}
+    <div class="form-grid">
+      <label><span>Apple-ID</span><input type="email" name="apple_id" required autocomplete="username" value="{h(acc.get('apple_id'))}"></label>
+      <label><span>Passwort</span><input type="password" name="password" required autocomplete="current-password"></label>
+    </div>
+    <div class="form-actions"><button class="button primary">{'Neu anmelden' if acc.get('login_at') else 'Anmelden'}</button></div>
+  </form>
+  <form method="post" action="{base}/accounts/save">{hidden}
+    <div class="form-grid">{account_fields(acc)}</div>
+    <div class="form-actions"><button class="button">Speichern</button></div>
+  </form>
+  <form method="post" action="{base}/accounts/delete" class="form-actions">{hidden}
+    <button class="button danger">Konto entfernen</button>
+    <span class="muted">Bereits gesicherte Dateien bleiben im Ziel erhalten.</span>
+  </form>
+</article>"""
+
+
+def accounts_page(base: str) -> str:
     pending = STATE.get("pending")
-    if pending:
+    if pending and pending["account"] in STATE["accounts"]:
+        name = STATE["accounts"][pending["account"]]["name"]
         return f"""<article class="card form">
-  <div class="setup-step"><span>2</span><div><strong>Anmeldung bestätigen</strong><small>{h(pending['apple_id'])}</small></div></div>
-  <form method="post" action="{base}/login/code">
+  <div class="setup-step"><span>2</span><div><strong>Anmeldung bestätigen: {h(name)}</strong><small>{h(pending['apple_id'])}</small></div></div>
+  <form method="post" action="{base}/accounts/code">
     <div class="form-grid">{question_field(pending['option'])}</div>
     <p class="muted">Ist Erweiterter Datenschutz (ADP) aktiv, musst du den Zugriff danach eventuell noch auf einem Apple-Gerät erlauben.</p>
     <div class="form-actions"><button class="button primary">Bestätigen</button></div>
   </form>
-  <form method="post" action="{base}/login/reset" class="form-actions"><button class="button">Abbrechen und neu beginnen</button></form>
+  <form method="post" action="{base}/accounts/reset" class="form-actions"><button class="button">Abbrechen und neu beginnen</button></form>
 </article>"""
-    login = STATE["login"]
-    text, level = login_status_text(datetime.now())
-    status = ""
-    if login.get("login_at"):
-        valid_until = datetime.fromisoformat(login["login_at"]) + timedelta(days=TOKEN_DAYS)
-        status = (f'<article class="card form"><h2>Aktuelle Anmeldung</h2><dl class="facts">'
-                  f'<div><dt>Apple-ID</dt><dd>{h(login.get("apple_id"))}</dd></div>'
-                  f'<div><dt>Angemeldet am</dt><dd>{fmt_time(login["login_at"])}</dd></div>'
-                  f'<div><dt>Gültig bis</dt><dd>{fmt_time(valid_until.isoformat())}</dd></div>'
-                  f'<div><dt>Status</dt><dd class="{level}">{h(text)}</dd></div></dl></article>')
-    return f"""{status}
+    now = datetime.now()
+    cards = "".join(account_card(base, acc_id, acc, now) for acc_id, acc in account_items())
+    return f"""{target_datalist()}{cards}
 <article class="card form">
-  <div class="setup-step"><span>1</span><div><strong>{'Neu anmelden' if login.get('login_at') else 'Bei iCloud anmelden'}</strong>
-  <small>Apple verlangt die Anmeldung alle {TOKEN_DAYS} Tage neu</small></div></div>
+  <div class="setup-step"><span>+</span><div><strong>Konto hinzufügen</strong>
+  <small>Je Apple-ID ein Konto mit eigenem Zielordner. Apple verlangt die Anmeldung alle {TOKEN_DAYS} Tage neu.</small></div></div>
   <ul class="setup-guide">
-    <li>Auf dem iPhone muss <b>Einstellungen → Apple-Account → iCloud → „Auf iCloud-Daten im Web zugreifen“</b> eingeschaltet sein.</li>
+    <li>Auf dem iPhone dieser Apple-ID muss <b>Einstellungen → Apple-Account → iCloud → „Auf iCloud-Daten im Web zugreifen“</b> eingeschaltet sein.</li>
     <li>Normales Apple-ID-Passwort verwenden, <b>app-spezifische Passwörter funktionieren nicht</b>.</li>
+    <li>Der 2FA-Code kommt auf den Geräten <b>dieser</b> Apple-ID an, die Person muss also erreichbar sein.</li>
     <li>Das Passwort wird nur an rclone übergeben und verschleiert in <code>/data/rclone.conf</code> abgelegt.
         Diese Datei ist von Home-Assistant-Backups ausgenommen.</li>
   </ul>
-  <form method="post" action="{base}/login">
+  <form method="post" action="{base}/accounts/add">
     <div class="form-grid">
-      <label><span>Apple-ID</span><input type="email" name="apple_id" required autocomplete="username" value="{h(login.get('apple_id'))}"></label>
-      <label><span>Passwort</span><input type="password" name="password" required autocomplete="current-password"></label>
+      {account_fields({})}
+      <label><span>Apple-ID</span><input type="email" name="apple_id" required autocomplete="off"></label>
+      <label><span>Passwort</span><input type="password" name="password" required autocomplete="new-password"></label>
     </div>
-    <div class="form-actions"><button class="button primary">Anmelden</button></div>
+    <div class="form-actions"><button class="button primary">Hinzufügen und anmelden</button></div>
   </form>
 </article>"""
 
 
 def settings_page(base: str) -> str:
-    settings = STATE["settings"]
-    candidates = target_candidates()
-    datalist = "".join(f'<option value="{h(path)}">' for path, _ in candidates)
     rows = "".join(
         f'<tr><td><code>{h(path)}</code></td><td><span class="status {"ok" if mounted else "error"}">'
         f'{"Freigabe eingebunden" if mounted else "Lokaler Ordner"}</span></td></tr>'
-        for path, mounted in candidates
+        for path, mounted in target_candidates()
     ) or '<tr><td colspan="2" class="empty">Keine Ordner unter /share oder /media gefunden.</td></tr>'
-    checked = {key: "checked" if settings[key] else "" for key in JOBS}
     return f"""<article class="card form">
   <form method="post" action="{base}/settings">
     <div class="form-grid">
-      <label class="wide"><span>Sicherungsziel</span>
-        <input name="target" list="targets" required placeholder="/share/nas-backup" value="{h(settings['target'])}">
-        <datalist id="targets">{datalist}</datalist></label>
-      <label class="check"><input type="checkbox" name="drive" {checked['drive']}><span>iCloud Drive sichern</span></label>
-      <label class="check"><input type="checkbox" name="photos" {checked['photos']}><span>iCloud-Fotos sichern</span></label>
       <label><span>Intervall in Stunden</span>
-        <input type="number" name="interval_hours" min="1" max="168" required value="{h(settings['interval_hours'])}"></label>
+        <input type="number" name="interval_hours" min="1" max="168" required value="{h(STATE['settings']['interval_hours'])}"></label>
     </div>
-    <p class="muted">Im Ziel entstehen die Ordner <code>iCloud Drive</code> und <code>iCloud Fotos</code>.
-    Es wird nur kopiert: Was in iCloud gelöscht wird, bleibt in der Sicherung erhalten.
-    Geänderte Dateien werden in der Sicherung überschrieben.</p>
+    <p class="muted">Alle Konten werden nacheinander gesichert. Im Ziel jedes Kontos entstehen die Ordner
+    <code>iCloud Drive</code> und <code>iCloud Fotos</code>. Es wird nur kopiert: Was in iCloud gelöscht wird,
+    bleibt in der Sicherung erhalten. Geänderte Dateien werden in der Sicherung überschrieben.</p>
     <div class="form-actions"><button class="button primary">Speichern</button></div>
   </form>
 </article>
@@ -558,21 +728,23 @@ def settings_page(base: str) -> str:
 
 def log_page() -> str:
     parts = []
-    for key, job in JOBS.items():
-        path = LOG_DIR / f"{key}.log"
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:] if path.exists() else []
-        out = []
-        for line in lines:
-            try:
-                entry = json.loads(line)
-                obj = f"{entry['object']}: " if entry.get("object") else ""
-                out.append(f"{entry.get('time', '')[:19].replace('T', ' ')}  {entry.get('level', '').upper():7} "
-                           f"{obj}{entry.get('msg', '').strip()}")
-            except ValueError:
-                out.append(line)
-        text = h("\n".join(out)) or "Noch kein Protokoll vorhanden."
-        parts.append(f'<article class="card form"><h2>{job["label"]}</h2><pre class="command-block">{text}</pre></article>')
-    return "".join(parts)
+    for acc_id, acc in account_items():
+        for key, job in JOBS.items():
+            path = log_path(acc_id, key)
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:] if path.exists() else []
+            out = []
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    obj = f"{entry['object']}: " if entry.get("object") else ""
+                    out.append(f"{entry.get('time', '')[:19].replace('T', ' ')}  {entry.get('level', '').upper():7} "
+                               f"{obj}{entry.get('msg', '').strip()}")
+                except ValueError:
+                    out.append(line)
+            text = h("\n".join(out)) or "Noch kein Protokoll vorhanden."
+            parts.append(f'<article class="card form"><h2>{h(acc["name"])} – {job["label"]}</h2>'
+                         f'<pre class="command-block">{text}</pre></article>')
+    return "".join(parts) or alert("Noch kein Konto eingerichtet.")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -599,7 +771,7 @@ def handle_post(path: str, form: dict) -> tuple[str, str, str]:
     """Führt eine Aktion aus und liefert (Ziel, Meldung, Stufe)."""
     if path == "/run":
         if not is_ready():
-            raise ValueError("Erst anmelden und ein Ziel festlegen.")
+            raise ValueError("Erst ein Konto anmelden und ein Ziel festlegen.")
         start_backup_thread()
         return "/", "Sicherung gestartet.", "success"
     if path == "/cancel":
@@ -608,48 +780,53 @@ def handle_post(path: str, form: dict) -> tuple[str, str, str]:
             if RUN["proc"]:
                 RUN["proc"].terminate()
         return "/", "Sicherung wird abgebrochen.", "success"
-    if path.startswith("/login") and not AUTH_LOCK.acquire(blocking=False):
-        raise ValueError("Es läuft bereits eine Anmeldung. Bitte kurz warten.")
-    try:
-        return handle_login(path, form) if path.startswith("/login") else handle_settings(path, form)
-    finally:
-        if path.startswith("/login"):
-            AUTH_LOCK.release()
-
-
-def handle_login(path: str, form: dict) -> tuple[str, str, str]:
-    if path == "/login":
-        done = login_start(form.get("apple_id", "").strip(), form.get("password", ""))
-        return "/login", "Angemeldet." if done else "", "success"
-    if path == "/login/code":
-        done = login_continue(form.get("answer", ""))
-        return ("/", "Angemeldet. Die Sicherung startet automatisch.", "success") if done else ("/login", "", "")
-    if path == "/login/reset":
-        with LOCK:
-            STATE.pop("pending", None)
-            save_state()
-        return "/login", "", ""
-    raise LookupError(path)
-
-
-def handle_settings(path: str, form: dict) -> tuple[str, str, str]:
     if path == "/settings":
-        target = validate_target(form.get("target", ""))
         hours = int(form.get("interval_hours") or 24)
         if not 1 <= hours <= 168:
             raise ValueError("Das Intervall muss zwischen 1 und 168 Stunden liegen.")
         with LOCK:
-            STATE["settings"] = {"target": str(target), "drive": "drive" in form, "photos": "photos" in form,
-                                 "interval_hours": hours}
+            STATE["settings"]["interval_hours"] = hours
             save_state()
+        return "/settings", "Gespeichert.", "success"
+    if not path.startswith("/accounts/"):
+        raise LookupError(path)
+    if not AUTH_LOCK.acquire(blocking=False):
+        raise ValueError("Es läuft bereits eine Anmeldung. Bitte kurz warten.")
+    try:
+        return handle_accounts(path, form)
+    finally:
+        AUTH_LOCK.release()
+
+
+def handle_accounts(path: str, form: dict) -> tuple[str, str, str]:
+    acc_id = form.get("id", "")
+    if path == "/accounts/add":
+        acc_id = add_account(form)
+        done = login_start(acc_id, form.get("apple_id", "").strip(), form.get("password", ""))
+        return "/accounts", "Konto angelegt und angemeldet." if done else "", "success"
+    if path == "/accounts/login":
+        done = login_start(acc_id, form.get("apple_id", "").strip(), form.get("password", ""))
+        return "/accounts", "Angemeldet." if done else "", "success"
+    if path == "/accounts/code":
+        done = login_continue(form.get("answer", ""))
+        return ("/", "Angemeldet. Die Sicherung startet automatisch.", "success") if done else ("/accounts", "", "")
+    if path == "/accounts/reset":
+        with LOCK:
+            STATE.pop("pending", None)
+            save_state()
+        return "/accounts", "", ""
+    if path == "/accounts/save":
+        target = update_account(acc_id, form)
         warning = "" if on_mount(target) else " Achtung: Das Ziel ist keine eingebundene Freigabe, es wird nicht gesichert."
-        return "/settings", "Gespeichert." + warning, "success" if not warning else "error"
+        return "/accounts", "Gespeichert." + warning, "success" if not warning else "error"
+    if path == "/accounts/delete":
+        return "/accounts", f"Konto „{delete_account(acc_id)}“ entfernt.", "success"
     raise LookupError(path)
 
 
 PAGES = {
     "/": ("Übersicht", "dashboard"),
-    "/login": ("Anmeldung", "login"),
+    "/accounts": ("Konten", "accounts"),
     "/settings": ("Einstellungen", "settings"),
     "/log": ("Protokoll", "log"),
 }
@@ -666,7 +843,7 @@ def application(environ, start_response):
         except LookupError:
             return respond(start_response, "Nicht gefunden", 404)
         except (ValueError, OSError) as exc:
-            back = "/login" if path.startswith("/login") else ("/settings" if path == "/settings" else "/")
+            back = "/accounts" if path.startswith("/accounts") else ("/settings" if path == "/settings" else "/")
             return redirect(start_response, base, back, str(exc), "error")
         return redirect(start_response, base, target, message, level)
     if path not in PAGES:
@@ -674,7 +851,7 @@ def application(environ, start_response):
     title, active = PAGES[path]
     query = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
     flash = alert(h(query["msg"][-1]), query.get("level", ["success"])[-1]) if "msg" in query else ""
-    body = {"dashboard": lambda: dashboard(base), "login": lambda: login_page(base),
+    body = {"dashboard": lambda: dashboard(base), "accounts": lambda: accounts_page(base),
             "settings": lambda: settings_page(base), "log": log_page}[active]()
     refresh = active == "dashboard" and RUN["active"]
     return respond(start_response, layout(base, title, flash + body, active, refresh))

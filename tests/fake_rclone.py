@@ -9,7 +9,9 @@ args = sys.argv[1:]
 conf = Path(args[args.index("--config") + 1])
 Path(os.environ["FAKE_RCLONE_CALLS"]).open("a").write(json.dumps(args) + "\n")
 
-if "create" in args:
+if "delete" in args:
+    pass
+elif "create" in args:
     if "password=falsch" in args:
         print("2026/10/12 NOTICE: Config file not found\nError: failed to create config: Apple-ID oder Passwort falsch", file=sys.stderr)
         sys.exit(1)

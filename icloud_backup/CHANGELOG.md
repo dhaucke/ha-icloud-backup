@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.10.4
+
+- Mehrere Apple-IDs: Unter „Konten“ beliebig viele Konten anlegen, jedes mit eigener Anmeldung, eigenem Zielordner und eigener Auswahl Drive/Fotos. Gesichert wird nacheinander im gemeinsamen Intervall.
+- Das bisherige Konto wird beim Update übernommen und behält sein Ziel, es wird nichts neu heruntergeladen.
+- Ablauf-Warnungen und Fehlermeldungen nennen das betroffene Konto.
+
 ## 2026.10.3
 
 - iCloud Drive: Paket-Dokumente (Pages, Numbers, Keynote, Pixelmator …) brechen nicht mehr mit „corrupted on transfer: sizes differ“ ab. iCloud meldet für sie die entpackte Größe, liefert aber ein ZIP.
